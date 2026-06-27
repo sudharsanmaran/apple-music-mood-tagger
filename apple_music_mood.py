@@ -157,8 +157,8 @@ def _clean(title):
 
 
 def spotify_find_track(name, artist, dur_sec):
-    """Search Spotify and return (track_id, primary_artist_id) for the best
-    match, scoring by artist overlap and duration closeness. None if no hit."""
+    """Search Spotify and return the best-match track id, scoring by artist
+    overlap and duration closeness. None if no hit."""
     q = f'track:{_clean(name)} artist:{_clean(artist)}'
     url = f"{SPOTIFY_API}/search?" + urllib.parse.urlencode(
         {"q": q, "type": "track", "limit": 10})
@@ -197,18 +197,7 @@ def spotify_find_track(name, artist, dur_sec):
         return s
 
     best = max(items, key=score)
-    artist_id = best["artists"][0]["id"] if best.get("artists") else None
-    return best["id"], artist_id
-
-
-def spotify_artist_genres(artist_id):
-    if not artist_id:
-        return []
-    headers = {"Authorization": "Bearer " + spotify_token()}
-    try:
-        return _fetch_json(f"{SPOTIFY_API}/artists/{artist_id}", headers=headers).get("genres", [])
-    except Exception:
-        return []
+    return best["id"]
 
 
 # --- ReccoBeats --------------------------------------------------------------
@@ -233,13 +222,23 @@ def mood_bucket(energy):
     return "Light Dance"
 
 
-def language_bucket(artist_genres, music_genre):
-    blob = " ".join(artist_genres).lower() + " " + (music_genre or "").lower()
-    if any(m in blob for m in TAMIL_MARKERS):
+def language_bucket(music_genre, isrc):
+    """Guess language from Apple's genre tag first (the only Tamil-specific
+    signal), then the ISRC country code (first 2 chars; 'IN' = India).
+
+    NOTE: ISRC country can't tell Tamil from Hindi/Telugu, so an Indian track
+    with no 'Tamil' genre tag defaults to Tamil here (this library is
+    Tamil-dominant). Flip that default below if you have lots of other-Indian.
+    """
+    mg = (music_genre or "").lower()
+    country = (isrc or "")[:2].upper()
+    if any(m in mg for m in TAMIL_MARKERS):
         return "Tamil"
-    if any(m in blob for m in INDIAN_MARKERS):
-        return "Others"            # other Indian languages
-    if artist_genres:              # Spotify knew the artist, no Indian marker
+    if any(m in mg for m in INDIAN_MARKERS):
+        return "Others"            # genre explicitly names another Indian lang
+    if country == "IN":
+        return "Tamil"             # Indian release, no other marker -> assume Tamil
+    if country:                    # released elsewhere
         return "English"
     return "Others"                # unknown
 
@@ -289,13 +288,12 @@ def main():
             skipped += 1
             continue
 
-        found = spotify_find_track(tr["name"], tr["artist"], tr["dur_sec"])
-        if not found:
+        spotify_id = spotify_find_track(tr["name"], tr["artist"], tr["dur_sec"])
+        if not spotify_id:
             print(f"  MISS   {label}  (no Spotify match)")
             miss += 1
             time.sleep(REQUEST_PAUSE)
             continue
-        spotify_id, artist_id = found
 
         feats = reccobeats_features(spotify_id)
         time.sleep(REQUEST_PAUSE)
@@ -306,7 +304,7 @@ def main():
 
         energy = float(feats["energy"])
         mood = mood_bucket(energy)
-        lang = language_bucket(spotify_artist_genres(artist_id), tr["genre"])
+        lang = language_bucket(tr["genre"], feats.get("isrc"))
         grouping = f"{lang} / {mood}"
         bpm = None
         if feats.get("tempo"):
