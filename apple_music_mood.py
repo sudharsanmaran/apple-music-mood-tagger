@@ -8,9 +8,11 @@ touches the audio file. For each selected track it:
     1. reads title + artist + duration from the Music app (AppleScript),
     2. finds the matching track on Spotify (to get a Spotify track ID),
     3. looks up that ID on ReccoBeats -> energy, danceability, tempo (BPM),
-    4. buckets it into a mood:  Mellow / Light Dance / Heavy Beat,
-    5. guesses language (Tamil / English / Others) from Spotify artist genres,
-    6. writes "Tamil / Heavy Beat" into the Grouping field (and BPM into BPM).
+    4. buckets it on the energy x valence map into one of:
+         Groove / Anthem / Intense / Warm / Soulful,
+    5. guesses language (Tamil / English / Others) from genre + ISRC country,
+    6. writes "Tamil / Groove (upbeat + danceable)" into Grouping (and BPM).
+    Tracks with no audio data are written as "<lang> / Untagged (no data)".
 
 ------------------------------------------------------------------------------
 ONE-TIME SETUP
@@ -61,11 +63,26 @@ REQUEST_PAUSE = 0.25     # seconds between lookups, to be polite
 USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
-# Mood thresholds on ReccoBeats "energy" (0..1). Tune after a dry run.
-ENERGY_MELLOW_MAX = 0.50   # below this  -> Mellow
-ENERGY_HEAVY_MIN = 0.72    # at/above    -> Heavy Beat ; between -> Light Dance
+# Category split points (all 0..1). Tune after a dry run.
+#   energy   = calm (low) .. intense (high)
+#   valence  = sad/dark (low) .. happy/bright (high)
+#   dance    = no groove (low) .. very groovy (high)
+ENERGY_SPLIT = 0.55    # at/above = energetic; below = calm
+VALENCE_SPLIT = 0.50   # at/above = bright/happy; below = dark/sad
+DANCE_SPLIT = 0.65     # within energetic+bright: at/above = Groove, below = Anthem
 
-# Spotify artist-genre markers that mean "Tamil" vs "Other Indian" vs western.
+# Human-readable category labels (the bracket hints make them self-explanatory
+# inside the Music Grouping column). These map onto the energy x valence map.
+CATEGORIES = {
+    "groove":   "Groove (upbeat + danceable)",
+    "anthem":   "Anthem (upbeat + powerful)",
+    "intense":  "Intense (heavy / serious)",
+    "warm":     "Warm (calm + pleasant)",
+    "soulful":  "Soulful (calm + sad)",
+    "untagged": "Untagged (no data)",
+}
+
+# Genre/region markers that mean "Tamil" vs "Other Indian".
 TAMIL_MARKERS = ("tamil", "kollywood")
 INDIAN_MARKERS = (
     "indian", "desi", "filmi", "bollywood", "telugu", "malayalam",
@@ -214,12 +231,23 @@ def reccobeats_features(spotify_id):
 
 # --- Classification ----------------------------------------------------------
 
-def mood_bucket(energy):
-    if energy < ENERGY_MELLOW_MAX:
-        return "Mellow"
-    if energy >= ENERGY_HEAVY_MIN:
-        return "Heavy Beat"
-    return "Light Dance"
+def category_label(energy, valence, danceability):
+    """Map a track onto the energy x valence emotional map (Russell circumplex),
+    splitting the busy upbeat region by danceability. Returns a CATEGORIES label.
+
+        energetic + dark            -> Intense
+        energetic + bright + groovy -> Groove
+        energetic + bright + steady -> Anthem
+        calm + bright               -> Warm
+        calm + dark                 -> Soulful
+    """
+    energetic = energy >= ENERGY_SPLIT
+    bright = valence >= VALENCE_SPLIT
+    if energetic:
+        if not bright:
+            return CATEGORIES["intense"]
+        return CATEGORIES["groove"] if danceability >= DANCE_SPLIT else CATEGORIES["anthem"]
+    return CATEGORIES["warm"] if bright else CATEGORIES["soulful"]
 
 
 def language_bucket(music_genre, isrc):
@@ -279,33 +307,42 @@ def main():
         sys.exit("No tracks selected. Select songs in Music, then run again.")
 
     print(f"Selected {len(tracks)} track(s).\n")
-    tagged = miss = skipped = 0
+    tagged = untagged = skipped = 0
 
     for tr in tracks:
         label = f'{tr["name"]} — {tr["artist"]}'
         if tr["grouping"] and not args.force:
-            print(f"  skip   {label}  (grouping already '{tr['grouping']}')")
+            print(f"  skip    {label}  (grouping already '{tr['grouping']}')")
             skipped += 1
             continue
 
         spotify_id = spotify_find_track(tr["name"], tr["artist"], tr["dur_sec"])
-        if not spotify_id:
-            print(f"  MISS   {label}  (no Spotify match)")
-            miss += 1
-            time.sleep(REQUEST_PAUSE)
-            continue
-
-        feats = reccobeats_features(spotify_id)
+        feats = reccobeats_features(spotify_id) if spotify_id else None
         time.sleep(REQUEST_PAUSE)
+
+        # No usable audio data -> group it for manual sorting, never guess.
         if not feats or feats.get("energy") is None:
-            print(f"  MISS   {label}  (no ReccoBeats features — likely pre-Nov-2024 gap)")
-            miss += 1
+            lang = language_bucket(tr["genre"], None)
+            grouping = f"{lang} / {CATEGORIES['untagged']}"
+            why = "no Spotify match" if not spotify_id else "no ReccoBeats data"
+            if args.dry_run:
+                print(f"  ----    {label}  ->  '{grouping}'  ({why})")
+            else:
+                try:
+                    set_grouping(tr["dbid"], grouping)
+                    print(f"  untag   {label}  ->  '{grouping}'  ({why})")
+                except RuntimeError as e:
+                    print(f"  FAIL    {label}  (couldn't write: {e})")
+            untagged += 1
             continue
 
         energy = float(feats["energy"])
-        mood = mood_bucket(energy)
+        valence = float(feats.get("valence") or 0.5)
+        dance = float(feats.get("danceability") or 0.0)
+        cat = category_label(energy, valence, dance)
         lang = language_bucket(tr["genre"], feats.get("isrc"))
-        grouping = f"{lang} / {mood}"
+        grouping = f"{lang} / {cat}"
+
         bpm = None
         if feats.get("tempo"):
             try:
@@ -313,27 +350,28 @@ def main():
             except (ValueError, TypeError):
                 bpm = None
 
-        detail = f"energy={energy:.2f} dance={feats.get('danceability')}"
+        detail = f"e={energy:.2f} v={valence:.2f} d={dance:.2f}"
         if bpm:
             detail += f" bpm={bpm}"
 
         if args.dry_run:
-            print(f"  ----   {label}  ->  '{grouping}'  ({detail})")
+            print(f"  ----    {label}  ->  '{grouping}'  ({detail})")
+            tagged += 1
         else:
             try:
                 set_grouping(tr["dbid"], grouping)
                 if bpm and not args.no_bpm and (not tr["cur_bpm"] or args.force):
                     set_bpm(tr["dbid"], bpm)
-                print(f"  tag    {label}  ->  '{grouping}'  ({detail})")
+                print(f"  tag     {label}  ->  '{grouping}'  ({detail})")
                 tagged += 1
             except RuntimeError as e:
-                print(f"  FAIL   {label}  (couldn't write: {e})")
-                miss += 1
+                print(f"  FAIL    {label}  (couldn't write: {e})")
 
-    print(f"\nDone. Tagged: {tagged}   Skipped: {skipped}   No data: {miss}")
-    if miss:
-        print("MISS = no Spotify match or no ReccoBeats features (common for brand-new\n"
-              "2025 releases). Those can be grouped by hand in the Grouping field.")
+    print(f"\nDone. Tagged: {tagged}   Untagged (no data): {untagged}   Skipped: {skipped}")
+    if untagged:
+        print("Untagged = no Spotify/ReccoBeats data (older or brand-new tracks).\n"
+              "They're grouped as '... / Untagged (no data)' — sort by Grouping in\n"
+              "Music to find and assign them by hand.")
 
 
 if __name__ == "__main__":

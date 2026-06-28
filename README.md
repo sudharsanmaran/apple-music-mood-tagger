@@ -25,11 +25,13 @@ No pip installs needed — it uses only Python 3's standard library plus
 
 ## apple_music_mood.py
 
-Tags selected tracks by **language + mood/energy** (e.g. `Tamil / Heavy Beat`)
-into the Grouping field, and fills BPM — using free audio features from
-[ReccoBeats](https://reccobeats.com) (energy, danceability, tempo). Works for
-Apple Music subscription streams, including regional/Tamil tracks that BPM
-databases don't cover.
+Tags selected tracks by **language + mood/energy** into the Grouping field
+(e.g. `Tamil / Groove (upbeat + danceable)`), and fills BPM — using free audio
+features from [ReccoBeats](https://reccobeats.com) (energy, valence,
+danceability, tempo). Categories come from the energy×valence emotional map:
+**Groove / Anthem / Intense / Warm / Soulful** (and `Untagged` when no data is
+found). Works for Apple Music subscription streams, including regional/Tamil
+tracks that BPM databases don't cover.
 
 Setup: register a free [Spotify Developer app](https://developer.spotify.com/dashboard)
 (used only to look up track IDs), then:
