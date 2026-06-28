@@ -13,9 +13,10 @@ Group the library by how songs *feel*.
 - [x] Detect language (Tamil / English / Others)
 - [x] Write tags + raw numbers + BPM into Music metadata; Smart-Playlist-ready
 - [x] Cache everything on the song so re-tuning is offline + instant (`--retune`)
+- [x] Incremental by design — already-tagged songs are skipped before any API call
+- [x] `--batch N` for rate-limit-safe first passes
 - [ ] Improve language detection (foreign-label Tamil songs misread as English)
 - [ ] Optional Deezer bridge to drop the Spotify dependency
-- [ ] `--batch N` for rate-limit-safe first passes
 
 ## 🔜 Stage 2 — Find similar songs
 

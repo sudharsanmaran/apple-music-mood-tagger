@@ -135,6 +135,18 @@ Every song's Comments holds its raw numbers **and** `spotify=<id>`. So:
 The only time the rate-limited Spotify search runs is the **first** time a song
 is seen. Everything after that is cached.
 
+## Incremental workflow (as your library grows)
+
+1. Keep a **regular playlist** of songs you want to organize; add to it over time.
+2. Run `python3 apple_music_mood.py` on it whenever you've added songs. The
+   script **skips any song that already has a Grouping — before making any API
+   call** — so re-runs only do work on *new* songs. No duplicate lookups, ever.
+3. For the first big pass (or to stay well under rate limits), chunk it:
+   `python3 apple_music_mood.py --batch 100` — it stops after 100 newly-fetched
+   songs; just re-run to continue where it left off.
+4. *(Optional)* A Smart Playlist with `Grouping is empty` gives you a live
+   "still to tag" queue.
+
 ## Notes
 
 - **Sync:** with Sync Library on (it is), all of this syncs to your other

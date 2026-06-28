@@ -511,6 +511,8 @@ def main():
     p.add_argument("--force", action="store_true", help="Re-fetch + overwrite even if already tagged")
     p.add_argument("--retune", action="store_true",
                    help="Re-bucket from cached Comments data only — NO network, no rate limit")
+    p.add_argument("--batch", type=int, default=0, metavar="N",
+                   help="Stop after N newly-fetched songs (rate-limit-safe chunking; 0 = no limit)")
     p.add_argument("--no-bpm", action="store_true", help="Tag mood only; don't write BPM")
     p.add_argument("--no-comments", action="store_true", help="Don't write raw audio numbers into Comments")
     args = p.parse_args()
@@ -528,7 +530,7 @@ def main():
 
     mode = "RETUNE (offline)" if args.retune else "FETCH"
     print(f"Selected {len(tracks)} track(s).  Mode: {mode}\n")
-    tagged = untagged = skipped = 0
+    tagged = untagged = skipped = fetched = 0
 
     for tr in tracks:
         label = f'{tr["name"]} — {tr["artist"]}'
@@ -564,6 +566,12 @@ def main():
 
         status = classify_and_write(tr, feats, spotify_id, args)
         tagged += (status == "tagged"); untagged += (status == "untagged")
+
+        fetched += 1
+        if args.batch and fetched >= args.batch:
+            print(f"\n— Batch limit ({args.batch}) reached. Re-run to continue; "
+                  f"already-tagged songs are skipped automatically.")
+            break
 
     print(f"\nDone. Tagged: {tagged}   Untagged (no data): {untagged}   Skipped: {skipped}")
     if untagged:
