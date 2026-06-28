@@ -1,48 +1,101 @@
-# apple-music-bpm
+# 🎵 Apple Music Mood Tagger
 
-A small Python script that fills the **BPM** field of selected Apple Music
-tracks (macOS) by looking up each song's tempo in the free GetSongBPM database.
+Automatically organize an Apple Music library by **mood, energy, and language**,
+so similar songs live together — and build Smart Playlists that update
+themselves. Works on **streamed / DRM Apple Music tracks** (no audio files
+required), including regional catalogs (Tamil, etc.) that most BPM/mood
+databases don't cover.
 
-It works for streamed Apple Music tracks too, because it never touches the audio
-file — it reads each track's title + artist from the Music app via AppleScript,
-looks the tempo up online, and writes the number back.
+> **The motto — organize, then understand, your music:**
+> 1. **Now:** auto-group your library by how songs *feel* (mood / energy / groove).
+> 2. **Next:** "find songs similar to this one" using each track's audio fingerprint.
+> 3. **Later:** skip the boring parts of a song automatically.
 
-## Usage
+## What it does today
 
-1. Get a free API key at <https://getsongbpm.com/api> and paste it into the
-   `API_KEY` line near the top of `apple_music_bpm.py`.
-2. Open the Music app, open a playlist, and select the tracks you want.
-3. Run:
+For every selected song it:
 
-   ```sh
-   python3 apple_music_bpm.py --dry-run   # preview, writes nothing
-   python3 apple_music_bpm.py             # fill in BPM for the selection
-   python3 apple_music_bpm.py --force     # overwrite BPM even if already set
-   ```
+1. finds the track on **Spotify** (to get an ID),
+2. pulls audio features from **[ReccoBeats](https://reccobeats.com)** (free) —
+   energy, valence, danceability, tempo, acousticness, and more,
+3. classifies it into a mood category (**Groove / Anthem / Intense / Warm /
+   Soulful**) and a language (**Tamil / English / Others**),
+4. writes everything back into the song's metadata so you can build
+   **Smart Playlists** that group similar songs and stay up to date.
 
-No pip installs needed — it uses only Python 3's standard library plus
-`osascript`.
+Because the data lives on each song (and syncs across your devices via iCloud
+Music Library), you tag once and re-tune offline forever.
 
-## apple_music_mood.py
+## Quick start
 
-Tags selected tracks by **language + mood/energy** into the Grouping field
-(e.g. `Tamil / Groove (upbeat + danceable)`), and fills BPM — using free audio
-features from [ReccoBeats](https://reccobeats.com) (energy, valence,
-danceability, tempo). Categories come from the energy×valence emotional map:
-**Groove / Anthem / Intense / Warm / Soulful** (and `Untagged` when no data is
-found). Works for Apple Music subscription streams, including regional/Tamil
-tracks that BPM databases don't cover.
-
-Setup: register a free [Spotify Developer app](https://developer.spotify.com/dashboard)
-(used only to look up track IDs), then:
+**Requirements:** macOS with the Music app, Python 3 (standard library only —
+no `pip install`), and a free Spotify Developer app.
 
 ```sh
-export SPOTIFY_CLIENT_ID="..."
-export SPOTIFY_CLIENT_SECRET="..."
-python3 apple_music_mood.py --dry-run
+# 1. Create a free app at https://developer.spotify.com/dashboard (Web API).
+#    Redirect URI can be http://127.0.0.1:8888 . Copy the Client ID + Secret.
+export SPOTIFY_CLIENT_ID="your-client-id"
+export SPOTIFY_CLIENT_SECRET="your-client-secret"
+
+# 2. In the Music app, select the tracks you want to tag.
+
+# 3. Preview, then run:
+python3 apple_music_mood.py --dry-run    # shows what it would do, writes nothing
+python3 apple_music_mood.py              # tag new songs
+python3 apple_music_mood.py --retune     # re-bucket offline from cached data (no network)
 ```
+
+The first time, macOS asks to let Terminal control Music — click **OK**.
+
+Then build a Smart Playlist: **File → New → Smart Playlist**, rule
+`Grouping contains Groove`. See **[TAGGING.md](TAGGING.md)** for the full set of
+fields, tag words, and playlist recipes.
+
+## How it works
+
+```
+Apple Music song (name + artist)
+   → Spotify search        → track ID         [needs a free Spotify app; cached after first run]
+   → ReccoBeats            → audio features    [free, no key]
+   → classify + tag        → write to Music metadata
+```
+
+It writes across several fields so you can filter however you like:
+
+| Field | Holds |
+|-------|-------|
+| Grouping | trait tags + category (`tamil groovy bright … Groove`) |
+| Comments | every raw audio number + the Spotify ID (the cache) |
+| BPM | tempo |
+| Rating | energy ×100 (range-tunable) |
+| Movement Number | danceability ×100 (range-tunable) |
+
+Full reference: **[TAGGING.md](TAGGING.md)**.
+
+## Scripts
+
+- **`apple_music_mood.py`** — the main tool (mood/energy/language + BPM via ReccoBeats).
+- **`apple_music_bpm.py`** — a minimal, BPM-only alternative using
+  [GetSongBPM](https://getsongbpm.com) (no Spotify needed, but weak coverage of
+  regional music). Kept as a simpler option.
+
+## Roadmap
+
+See **[ROADMAP.md](ROADMAP.md)** — the path from "organize by mood" to
+"find similar songs" to "skip the bad parts."
+
+## Contributing
+
+Contributions welcome — see **[CONTRIBUTING.md](CONTRIBUTING.md)**. Good first
+areas: better language detection, mood-threshold tuning, a Deezer bridge to
+drop the Spotify dependency, and the "find similar songs" feature.
 
 ## Credits
 
-BPM data provided by [GetSongBPM](https://getsongbpm.com).
-Audio features provided by [ReccoBeats](https://reccobeats.com).
+- Audio features by **[ReccoBeats](https://reccobeats.com)**.
+- Track lookup via the **Spotify Web API**.
+- BPM (legacy script) by **[GetSongBPM](https://getsongbpm.com)**.
+
+## License
+
+[MIT](LICENSE) © 2026 Sudharsan Maran.
