@@ -8,11 +8,17 @@ touches the audio file. For each selected track it:
     1. reads title + artist + duration from the Music app (AppleScript),
     2. finds the matching track on Spotify (to get a Spotify track ID),
     3. looks up that ID on ReccoBeats -> energy, danceability, tempo (BPM),
-    4. buckets it on the energy x valence map into one of:
-         Groove / Anthem / Intense / Warm / Soulful,
+    4. derives independent trait tags (groovy, bright, energy-mid, rappy, ...)
+       plus a suggested category word (Groove/Anthem/Intense/Warm/Soulful),
     5. guesses language (Tamil / English / Others) from genre + ISRC country,
-    6. writes "Tamil / Groove (upbeat + danceable)" into Grouping (and BPM).
-    Tracks with no audio data are written as "<lang> / Untagged (no data)".
+    6. writes them across several fields so you can build Smart Playlists:
+         Grouping  = the trait tags + category word  (for "contains" rules)
+         Comments  = every raw audio number (reference)
+         BPM       = tempo            (range-tunable)
+         Rating    = energy x100      (range-tunable; you don't use stars)
+         Movement# = danceability x100 (range-tunable; empty classical field)
+    See TAGGING.md for the full field + tag-word reference.
+    Tracks with no audio data get Grouping "<lang> untagged no-data".
 
 ------------------------------------------------------------------------------
 ONE-TIME SETUP
@@ -45,6 +51,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -74,6 +81,24 @@ GROOVE_DANCE_MIN = 0.65     # danceability needed to count as a groove
 GROOVE_ENERGY_FLOOR = 0.55  # ...but it also needs at least this much energy
 ENERGY_HIGH = 0.70          # non-danceable + this energy = Anthem/Intense (powerful/heavy)
 VALENCE_SPLIT = 0.50        # at/above = bright/happy; below = dark/sad
+
+# Band edges for the independent TRAIT TAGS written into Grouping. These are
+# what you build Smart Playlists from ("Grouping contains groovy"), and a song
+# carries every tag it qualifies for — so it can land in multiple playlists.
+ENERGY_LOW_MAX = 0.55       # < = energy-low ; < ENERGY_HIGH = energy-mid ; else energy-high
+DANCE_GROOVY = 0.65         # >= = "groovy" ; >= 0.50 = "dance-mid" ; else "dance-low"
+ACOUSTIC_MIN = 0.50         # >= = "acoustic" ; else "produced"
+INSTRUMENTAL_MIN = 0.50     # >= = "instrumental"
+SPEECH_RAP_MIN = 0.33       # >= = "rappy" (lots of spoken words / rap)
+LIVE_MIN = 0.60             # >= = "live"
+TEMPO_SLOW_MAX = 90         # < = "slow" ; < TEMPO_FAST_MIN = "mid-tempo" ; else "fast"
+TEMPO_FAST_MIN = 130
+
+# Numeric-field hijacks: store these 0..1 features x100 into spare numeric
+# fields so they're RANGE-tunable in Smart Playlists (e.g. "Movement Number >
+# 65"). See TAGGING.md. Set a flag False to leave that field untouched.
+WRITE_ENERGY_TO_RATING = True       # Rating = energy x100 (you don't use stars)
+WRITE_DANCE_TO_MOVEMENT = True      # Movement Number = danceability x100 (empty field)
 
 # Human-readable category labels (the bracket hints make them self-explanatory
 # inside the Music Grouping column). These map onto the energy x valence map.
@@ -145,12 +170,24 @@ def get_selected_tracks():
     return tracks
 
 
+class RateLimited(Exception):
+    """Raised on HTTP 429 so we stop cleanly instead of mislabeling everything."""
+    def __init__(self, retry_after):
+        self.retry_after = retry_after
+        super().__init__(f"rate limited; retry after {retry_after}s")
+
+
 def _fetch_json(url, headers=None, data=None, method=None):
     hdrs = {"User-Agent": USER_AGENT}
     hdrs.update(headers or {})
     req = urllib.request.Request(url, headers=hdrs, data=data, method=method)
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise RateLimited(e.headers.get("Retry-After", "?"))
+        raise
 
 
 # --- Spotify -----------------------------------------------------------------
@@ -186,6 +223,8 @@ def spotify_find_track(name, artist, dur_sec):
     headers = {"Authorization": "Bearer " + spotify_token()}
     try:
         items = _fetch_json(url, headers=headers)["tracks"]["items"]
+    except RateLimited:
+        raise
     except Exception:
         items = []
     if not items:
@@ -194,6 +233,8 @@ def spotify_find_track(name, artist, dur_sec):
             {"q": f"{_clean(name)} {_clean(artist)}", "type": "track", "limit": 10})
         try:
             items = _fetch_json(url, headers=headers)["tracks"]["items"]
+        except RateLimited:
+            raise
         except Exception:
             return None
     if not items:
@@ -228,6 +269,8 @@ def reccobeats_features(spotify_id):
     url = f"{RECCOBEATS_API}/audio-features?" + urllib.parse.urlencode({"ids": spotify_id})
     try:
         content = _fetch_json(url, headers={"Accept": "application/json"}).get("content") or []
+    except RateLimited:
+        raise
     except Exception:
         return None
     return content[0] if content else None
@@ -298,17 +341,71 @@ def set_comments(dbid, value):
         f'(first track whose database ID is {dbid}) to "{safe}"')
 
 
-def audio_info(feats, energy, valence, dance, bpm, cat_label):
-    """One-line, human-readable record of the numbers that drove the decision,
-    stored in the Comments field for transparency + finer playlists later."""
-    cat_word = cat_label.split(" (")[0]
+def set_rating(dbid, value):
+    """Rating is 0..100 in Music (= stars x20). We store energy x100 here."""
+    run_osascript(
+        f'tell application "Music" to set rating of '
+        f'(first track whose database ID is {dbid}) to {int(value)}')
+
+
+def set_movement(dbid, value):
+    """Movement Number (classical field, empty in this library). Stores dance x100."""
+    run_osascript(
+        f'tell application "Music" to set movement number of '
+        f'(first track whose database ID is {dbid}) to {int(value)}')
+
+
+def _band(value, low_edge, high_edge, low, mid, high):
+    if value < low_edge:
+        return low
+    if value < high_edge:
+        return mid
+    return high
+
+
+def build_tags(lang, feats, energy, valence, dance, bpm, cat_label):
+    """Independent trait tags for the Grouping field. A song carries EVERY tag
+    it qualifies for, so Smart Playlists ('Grouping contains groovy') can put
+    one song in many lists — no single-category priority needed. The suggested
+    category word (Groove/Warm/...) is appended so one-rule playlists also work.
+    """
+    tags = [lang.lower()]
+    tags.append(_band(energy, ENERGY_LOW_MAX, ENERGY_HIGH,
+                       "energy-low", "energy-mid", "energy-high"))
+    tags.append("groovy" if dance >= DANCE_GROOVY
+                else ("dance-mid" if dance >= 0.50 else "dance-low"))
+    tags.append("bright" if valence >= VALENCE_SPLIT else "dark")
+
     ac = feats.get("acousticness")
-    parts = [f"energy={energy:.2f}", f"valence={valence:.2f}", f"dance={dance:.2f}"]
     if ac is not None:
-        parts.append(f"acoustic={float(ac):.2f}")
+        tags.append("acoustic" if float(ac) >= ACOUSTIC_MIN else "produced")
+    if feats.get("instrumentalness") is not None and float(feats["instrumentalness"]) >= INSTRUMENTAL_MIN:
+        tags.append("instrumental")
+    if feats.get("speechiness") is not None and float(feats["speechiness"]) >= SPEECH_RAP_MIN:
+        tags.append("rappy")
+    if feats.get("liveness") is not None and float(feats["liveness"]) >= LIVE_MIN:
+        tags.append("live")
     if bpm:
-        parts.append(f"bpm={bpm}")
-    return " ".join(parts) + f" [{cat_word}]"
+        tags.append(_band(bpm, TEMPO_SLOW_MAX, TEMPO_FAST_MIN, "slow", "mid-tempo", "fast"))
+
+    tags.append(cat_label.split(" (")[0])   # the suggested category word
+    return " ".join(tags)
+
+
+def full_comments(feats, bpm):
+    """Every raw audio number we have, stored in Comments for reference."""
+    parts = []
+    for k in ("energy", "valence", "danceability", "acousticness",
+              "instrumentalness", "speechiness", "liveness", "loudness"):
+        v = feats.get(k)
+        if v is not None:
+            parts.append(f"{k}={float(v):.2f}")
+    if bpm:
+        parts.append(f"tempo={bpm}")
+    for k in ("key", "mode", "isrc"):
+        if feats.get(k) is not None:
+            parts.append(f"{k}={feats[k]}")
+    return " ".join(parts)
 
 
 # --- Main --------------------------------------------------------------------
@@ -342,14 +439,20 @@ def main():
             skipped += 1
             continue
 
-        spotify_id = spotify_find_track(tr["name"], tr["artist"], tr["dur_sec"])
-        feats = reccobeats_features(spotify_id) if spotify_id else None
+        try:
+            spotify_id = spotify_find_track(tr["name"], tr["artist"], tr["dur_sec"])
+            feats = reccobeats_features(spotify_id) if spotify_id else None
+        except RateLimited as e:
+            print(f"\n⚠  Rate limited by the API (Retry-After: {e.retry_after}s).")
+            print(f"   Tagged {tagged} song(s) before the limit. Wait, then re-run —")
+            print(f"   already-tagged songs are skipped automatically (no --force needed).")
+            break
         time.sleep(REQUEST_PAUSE)
 
         # No usable audio data -> group it for manual sorting, never guess.
         if not feats or feats.get("energy") is None:
             lang = language_bucket(tr["genre"], None)
-            grouping = f"{lang} / {CATEGORIES['untagged']}"
+            grouping = f"{lang.lower()} untagged no-data"
             why = "no Spotify match" if not spotify_id else "no ReccoBeats data"
             if args.dry_run:
                 print(f"  ----    {label}  ->  '{grouping}'  ({why})")
@@ -367,7 +470,6 @@ def main():
         dance = float(feats.get("danceability") or 0.0)
         cat = category_label(energy, valence, dance)
         lang = language_bucket(tr["genre"], feats.get("isrc"))
-        grouping = f"{lang} / {cat}"
 
         bpm = None
         if feats.get("tempo"):
@@ -376,22 +478,29 @@ def main():
             except (ValueError, TypeError):
                 bpm = None
 
-        info = audio_info(feats, energy, valence, dance, bpm, cat)
-        detail = f"e={energy:.2f} v={valence:.2f} d={dance:.2f}"
-        if bpm:
-            detail += f" bpm={bpm}"
+        grouping = build_tags(lang, feats, energy, valence, dance, bpm, cat)
+        comments = full_comments(feats, bpm)
+        rating = round(energy * 100)      # energy -> Rating field
+        movement = round(dance * 100)     # danceability -> Movement Number
 
+        nums = f"[rating={rating} mvt={movement}" + (f" bpm={bpm}]" if bpm else "]")
         if args.dry_run:
-            print(f"  ----    {label}  ->  '{grouping}'  ({detail})")
+            print(f"  ----    {label}")
+            print(f"            {grouping}   {nums}")
             tagged += 1
         else:
             try:
                 set_grouping(tr["dbid"], grouping)
+                if not args.no_comments:
+                    set_comments(tr["dbid"], comments)
                 if bpm and not args.no_bpm and (not tr["cur_bpm"] or args.force):
                     set_bpm(tr["dbid"], bpm)
-                if not args.no_comments:
-                    set_comments(tr["dbid"], info)
-                print(f"  tag     {label}  ->  '{grouping}'  ({detail})")
+                if WRITE_ENERGY_TO_RATING:
+                    set_rating(tr["dbid"], rating)
+                if WRITE_DANCE_TO_MOVEMENT:
+                    set_movement(tr["dbid"], movement)
+                print(f"  tag     {label}")
+                print(f"            {grouping}   {nums}")
                 tagged += 1
             except RuntimeError as e:
                 print(f"  FAIL    {label}  (couldn't write: {e})")
