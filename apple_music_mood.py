@@ -67,12 +67,13 @@ USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
 #   energy   = calm (low) .. intense (high)
 #   valence  = sad/dark (low) .. happy/bright (high)
 #   dance    = no groove (low) .. very groovy (high)
-ENERGY_SPLIT = 0.70    # at/above = energetic; below = calm
-                       # (0.70 because ReccoBeats "energy" tracks loudness/
-                       #  production density — lush romantic melodies score
-                       #  ~0.65, so a lower line mislabels them as energetic.)
-VALENCE_SPLIT = 0.50   # at/above = bright/happy; below = dark/sad
-DANCE_SPLIT = 0.65     # within energetic+bright: at/above = Groove, below = Anthem
+# Groove is decided by danceability + a small energy floor: a danceable
+# rap/party song at mid energy IS a groove, but an ultra-calm steady melody is
+# not. Only NON-danceable songs are then split by the high-energy line.
+GROOVE_DANCE_MIN = 0.65     # danceability needed to count as a groove
+GROOVE_ENERGY_FLOOR = 0.55  # ...but it also needs at least this much energy
+ENERGY_HIGH = 0.70          # non-danceable + this energy = Anthem/Intense (powerful/heavy)
+VALENCE_SPLIT = 0.50        # at/above = bright/happy; below = dark/sad
 
 # Human-readable category labels (the bracket hints make them self-explanatory
 # inside the Music Grouping column). These map onto the energy x valence map.
@@ -235,22 +236,23 @@ def reccobeats_features(spotify_id):
 # --- Classification ----------------------------------------------------------
 
 def category_label(energy, valence, danceability):
-    """Map a track onto the energy x valence emotional map (Russell circumplex),
-    splitting the busy upbeat region by danceability. Returns a CATEGORIES label.
+    """Classify on danceability + energy + valence. Returns a CATEGORIES label.
 
-        energetic + dark            -> Intense
-        energetic + bright + groovy -> Groove
-        energetic + bright + steady -> Anthem
-        calm + bright               -> Warm
-        calm + dark                 -> Soulful
+        danceable + enough energy          -> Groove   (move-your-body, any mood)
+        high energy, not danceable, dark   -> Intense
+        high energy, not danceable, bright -> Anthem
+        calm (low energy / not danceable), bright -> Warm
+        calm, dark                         -> Soulful
+
+    Danceability is the primary signal: it separates a mid-energy party/rap
+    groove (dance ~0.8) from a mid-energy romantic melody (dance ~0.5). The
+    energy floor keeps ultra-calm-but-steady songs out of Groove.
     """
-    energetic = energy >= ENERGY_SPLIT
-    bright = valence >= VALENCE_SPLIT
-    if energetic:
-        if not bright:
-            return CATEGORIES["intense"]
-        return CATEGORIES["groove"] if danceability >= DANCE_SPLIT else CATEGORIES["anthem"]
-    return CATEGORIES["warm"] if bright else CATEGORIES["soulful"]
+    if danceability >= GROOVE_DANCE_MIN and energy >= GROOVE_ENERGY_FLOOR:
+        return CATEGORIES["groove"]
+    if energy >= ENERGY_HIGH:
+        return CATEGORIES["intense"] if valence < VALENCE_SPLIT else CATEGORIES["anthem"]
+    return CATEGORIES["warm"] if valence >= VALENCE_SPLIT else CATEGORIES["soulful"]
 
 
 def language_bucket(music_genre, isrc):
