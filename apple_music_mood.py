@@ -289,6 +289,26 @@ def set_bpm(dbid, bpm):
         f'(first track whose database ID is {dbid}) to {bpm}')
 
 
+def set_comments(dbid, value):
+    safe = value.replace('"', '\\"')
+    run_osascript(
+        f'tell application "Music" to set comment of '
+        f'(first track whose database ID is {dbid}) to "{safe}"')
+
+
+def audio_info(feats, energy, valence, dance, bpm, cat_label):
+    """One-line, human-readable record of the numbers that drove the decision,
+    stored in the Comments field for transparency + finer playlists later."""
+    cat_word = cat_label.split(" (")[0]
+    ac = feats.get("acousticness")
+    parts = [f"energy={energy:.2f}", f"valence={valence:.2f}", f"dance={dance:.2f}"]
+    if ac is not None:
+        parts.append(f"acoustic={float(ac):.2f}")
+    if bpm:
+        parts.append(f"bpm={bpm}")
+    return " ".join(parts) + f" [{cat_word}]"
+
+
 # --- Main --------------------------------------------------------------------
 
 def main():
@@ -296,6 +316,7 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="Show results; write nothing")
     p.add_argument("--force", action="store_true", help="Overwrite Grouping/BPM even if already set")
     p.add_argument("--no-bpm", action="store_true", help="Tag mood only; don't write BPM")
+    p.add_argument("--no-comments", action="store_true", help="Don't write raw audio numbers into Comments")
     args = p.parse_args()
 
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
@@ -353,6 +374,7 @@ def main():
             except (ValueError, TypeError):
                 bpm = None
 
+        info = audio_info(feats, energy, valence, dance, bpm, cat)
         detail = f"e={energy:.2f} v={valence:.2f} d={dance:.2f}"
         if bpm:
             detail += f" bpm={bpm}"
@@ -365,6 +387,8 @@ def main():
                 set_grouping(tr["dbid"], grouping)
                 if bpm and not args.no_bpm and (not tr["cur_bpm"] or args.force):
                     set_bpm(tr["dbid"], bpm)
+                if not args.no_comments:
+                    set_comments(tr["dbid"], info)
                 print(f"  tag     {label}  ->  '{grouping}'  ({detail})")
                 tagged += 1
             except RuntimeError as e:
