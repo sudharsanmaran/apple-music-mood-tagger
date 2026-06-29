@@ -547,8 +547,12 @@ def main():
             continue
 
         # --- network fetch ---
-        if tr["grouping"] and not args.force:
-            print(f"  skip    {label}  (already tagged)")
+        # "Done" = we already have cached numbers, OR we already tried and found
+        # none. Old-format tags (grouping set but Comments empty) are NOT done,
+        # so they get refreshed without needing --force.
+        already = bool(cached) or ("untagged no-data" in (tr["grouping"] or ""))
+        if already and not args.force:
+            print(f"  skip    {label}  (already done)")
             skipped += 1
             continue
 
