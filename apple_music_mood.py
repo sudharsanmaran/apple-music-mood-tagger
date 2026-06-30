@@ -70,7 +70,8 @@ SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API = "https://api.spotify.com/v1"
 RECCOBEATS_API = "https://api.reccobeats.com/v1"
 
-REQUEST_PAUSE = 0.25     # seconds between lookups, to be polite
+REQUEST_PAUSE = 0.5      # seconds between lookups — spreads calls out to stay
+                         # under Spotify's rolling ~30s rate-limit window
 
 # ReccoBeats is behind Cloudflare, which bans urllib's default User-Agent
 # (error 1010). A browser-like UA gets through.
