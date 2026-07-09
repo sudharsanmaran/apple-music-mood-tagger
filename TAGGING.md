@@ -21,7 +21,7 @@ A song with no Spotify match or no ReccoBeats data is left honest: Grouping =
 | Field | What we store | Example | How to filter in a Smart Playlist |
 |---|---|---|---|
 | **Grouping** | trait tags + category word (text) | `tamil energy-mid groovy bright produced mid-tempo Groove` | `contains` a word |
-| **Comments** | every raw audio number (text, reference) | `energy=0.63 valence=0.52 danceability=0.70 …` | `contains` (exact text only) |
+| **Comments** | raw audio numbers + `spotify=<id>` cache; or a no-data marker (`no-audio-data` / `no-spotify-match` / `extract-failed`); `src=analysis` marks clip-analysed features | `energy=0.63 … spotify=abc src=analysis` | `contains` (exact text only) |
 | **BPM** | tempo, rounded | `120` | `is greater than` / `in the range` |
 | **Rating** | energy × 100 (= stars × 20) | `63` ≈ 3 stars | `Rating is greater than ★★★` |
 | **Movement Number** | danceability × 100 | `70` | `Movement Number is greater than 65` |
@@ -88,6 +88,18 @@ Derived by priority: **danceable+energy → Groove**, else **high-energy → Ant
 | `Intense` | high energy + dark / serious |
 | `Warm` | calm + pleasant |
 | `Soulful` | calm + sad |
+
+### Provenance flag (added when true)
+| Tag | Meaning |
+|---|---|
+| `approx` | Features came from **clip analysis** of a 30s preview (via `--retry-nodata`'s fallback), **not** Spotify's model. Comments also carry `src=analysis`. Used for regional tracks Spotify/ReccoBeats' lookup doesn't cover. |
+
+> ⚠️ **`approx` energy runs hot.** A 30s preview samples the loudest, catchiest
+> section (the hook), so extracted **energy (and tempo) skew high** vs. the full
+> track — measured ~+0.1 higher energy, landing in `energy-high` about twice as
+> often. Danceability/valence are steadier. Trust the *direction*, not the exact
+> number, and **exclude `approx` from energy-critical playlists** with
+> `Grouping does not contain approx` (or review them via `Grouping contains approx`).
 
 ## Smart Playlist recipes
 
