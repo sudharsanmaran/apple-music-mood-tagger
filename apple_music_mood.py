@@ -27,10 +27,14 @@ ReccoBeats needs no key. Spotify search needs a free developer app:
     1. Go to https://developer.spotify.com/dashboard  -> Create app.
        Redirect URI can be anything (e.g. http://localhost). No backlink needed.
     2. Copy the Client ID and Client Secret.
-    3. In the SAME Terminal window you run this from:
-         export SPOTIFY_CLIENT_ID="your-client-id"
-         export SPOTIFY_CLIENT_SECRET="your-client-secret"
-No pip installs needed. Standard library + osascript only.
+    3. Supply the credentials either way:
+         a) export them in the Terminal you run from:
+              export SPOTIFY_CLIENT_ID="your-client-id"
+              export SPOTIFY_CLIENT_SECRET="your-client-secret"
+         b) OR put them in a .env file next to this script (it's gitignored):
+              SPOTIFY_CLIENT_ID=your-client-id
+              SPOTIFY_CLIENT_SECRET=your-client-secret
+       Exported env vars win over .env. No pip installs — standard library only.
 
 ------------------------------------------------------------------------------
 HOW TO RUN
@@ -39,10 +43,16 @@ HOW TO RUN
     2. In Terminal:
          python3 apple_music_mood.py --dry-run   # preview, writes nothing
          python3 apple_music_mood.py             # fetch new songs, tag them
-         python3 apple_music_mood.py --force     # re-fetch + overwrite (reuses
-                                                 #   cached Spotify id, so no search)
+         python3 apple_music_mood.py --force     # from scratch: re-search Spotify
+                                                 #   (ignore cached id) + overwrite
          python3 apple_music_mood.py --retune    # OFFLINE: re-bucket from cached
                                                  #   Comments data, no network at all
+         python3 apple_music_mood.py --retry-nodata  # re-attempt ONLY the stuck
+                                                 #   'untagged no-data' songs, REUSING
+                                                 #   the cached Spotify id (ReccoBeats
+                                                 #   keeps adding tracks over time)
+         python3 apple_music_mood.py --retry-nodata --force  # same, but re-search
+                                                 #   Spotify from scratch (re-validate ids)
          python3 apple_music_mood.py --no-bpm    # tag mood only, skip BPM
 
 Workflow: fetch each song once (the only rate-limited step); the raw numbers +
@@ -63,6 +73,26 @@ import urllib.parse
 import urllib.request
 
 # ---------------------------------------------------------------------------
+def _load_dotenv():
+    """Populate os.environ from a .env file next to this script, if present.
+    Real exported env vars always win (we only setdefault). Keeps us dependency
+    free — no python-dotenv needed. Lines are KEY=value; # comments and blanks
+    are skipped; surrounding quotes on the value are stripped."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv()
+
 SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 
@@ -72,6 +102,12 @@ RECCOBEATS_API = "https://api.reccobeats.com/v1"
 
 REQUEST_PAUSE = 0.5      # seconds between lookups — spreads calls out to stay
                          # under Spotify's rolling ~30s rate-limit window
+
+# Minimum match score before we trust (and bank) a Spotify id. A real match
+# clears this via artist overlap (+3), a strong title match (+2), or a tight
+# duration match. Below it we return None so the song is stored as
+# 'no-spotify-match' (safely retryable) instead of pinned to a wrong track.
+MATCH_MIN_SCORE = 2.0
 
 # ReccoBeats is behind Cloudflare, which bans urllib's default User-Agent
 # (error 1010). A browser-like UA gets through.
@@ -249,25 +285,36 @@ def spotify_find_track(name, artist, dur_sec):
     if not items:
         return None
 
-    artist_lc = artist.lower()
+    artist_lc = artist.lower().strip()
+    qtitle_words = set(w for w in _clean(name).lower().split() if len(w) > 2)
     junk = ("remix", "sped up", "slowed", "lofi", "lo-fi", "instrumental",
             "cover", "karaoke", "live")
 
     def score(it):
         s = 0.0
         names = [a["name"].lower() for a in it.get("artists", [])]
-        if any(a in artist_lc or artist_lc in a for a in names):
+        # Artist overlap — but ONLY for a real (non-empty) artist. An empty artist
+        # made `"" in a` true for every candidate, banking false hits (e.g. test
+        # files with no artist matched to random tracks). Guard both sides.
+        if artist_lc and any(a and (a in artist_lc or artist_lc in a) for a in names):
             s += 3.0
+        # Title-word overlap — a positive "same song" signal so a correct match
+        # with differently-formatted artist credits still clears the floor.
+        twords = set(w for w in it["name"].lower().split() if len(w) > 2)
+        if qtitle_words and len(qtitle_words & twords) / len(qtitle_words) >= 0.5:
+            s += 2.0
         if dur_sec and it.get("duration_ms"):
             diff = abs(it["duration_ms"] / 1000.0 - dur_sec)
             s += max(0.0, 2.0 - diff / 5.0)   # within ~10s gives most of it
         tl = it["name"].lower()
         if any(j in tl for j in junk) and not any(j in name.lower() for j in junk):
             s -= 2.0
-        s += it.get("popularity", 0) / 100.0
+        s += (it.get("popularity") or 0) / 100.0   # popularity can be null
         return s
 
     best = max(items, key=score)
+    if score(best) < MATCH_MIN_SCORE:
+        return None                                 # too weak to trust — don't bank it
     return best["id"]
 
 
@@ -364,11 +411,16 @@ def set_movement(dbid, value):
         f'(first track whose database ID is {dbid}) to {int(value)}')
 
 
-def _not_in_library(err):
-    """A track that isn't actually in your Library can't be edited (error -1731
-    'Unknown object type'). Detect that so we can give a helpful message."""
+def _not_editable(err):
+    """Some tracks reject metadata writes; detect them so we report clearly and
+    keep going instead of dumping a raw FAIL:
+      -1731 'Unknown object type' -> the track isn't in your Library at all.
+      -10006 'not modifiable'     -> an Apple Music cloud/streaming catalog track
+                                     whose fields are read-only (not added locally).
+    Both are fixed the same way: Add to Library / download the track, then re-run."""
     s = str(err)
-    return "-1731" in s or "Unknown object type" in s
+    return ("-1731" in s or "Unknown object type" in s
+            or "-10006" in s or "not modifiable" in s)
 
 
 def _band(value, low_edge, high_edge, low, mid, high):
@@ -428,13 +480,36 @@ def full_comments(feats, bpm, spotify_id=None):
     return " ".join(parts)
 
 
+def nodata_comments(spotify_id):
+    """Comments for a song we processed but couldn't get audio features for.
+    Records a CLEAR reason and — crucially — keeps the Spotify id when we have
+    one, so a later `--retry-nodata` can skip the rate-limited search and just
+    re-hit ReccoBeats (whose catalog keeps growing):
+        'no-audio-data spotify=<id>'  -> found on Spotify, but ReccoBeats empty
+        'no-spotify-match'            -> never matched on Spotify (no id to keep)
+    """
+    if spotify_id:
+        return f"no-audio-data spotify={spotify_id}"
+    return "no-spotify-match"
+
+
 def parse_comments(text):
-    """Parse a Comments string we wrote back into a feature dict (+ spotify id).
-    Returns {} if it doesn't look like our cache."""
-    if not text or "energy=" not in text:
+    """Parse a Comments string we wrote back into a dict. Returns {} if it isn't
+    ours. Recognizes three shapes:
+      - full cache  -> feature numbers (energy=…) + spotify id
+      - no-audio    -> {'no_audio': True, 'spotify': <id>}  (retry can reuse id)
+      - no-spotify  -> {'no_spotify': True}
+    Use `'energy' in result` to tell "has real audio data" from a no-data marker."""
+    if not text:
         return {}
     out = {}
     for tok in text.split():
+        if tok == "no-audio-data":
+            out["no_audio"] = True
+            continue
+        if tok == "no-spotify-match":
+            out["no_spotify"] = True
+            continue
         if "=" not in tok:
             continue
         k, _, v = tok.partition("=")
@@ -460,19 +535,26 @@ def classify_and_write(tr, feats, spotify_id, args):
     label = f'{tr["name"]} — {tr["artist"]}'
 
     if not feats or feats.get("energy") is None:
-        lang = language_bucket(tr["genre"], None)
+        lang = language_bucket(tr["genre"], feats.get("isrc") if feats else None)
         grouping = f"{lang.lower()} untagged no-data"
+        # Keep the Spotify id (and a clear reason) in Comments — don't discard the
+        # rate-limited search result just because ReccoBeats had nothing yet. This
+        # is what lets --retry-nodata re-poll ReccoBeats cheaply later.
+        sid = spotify_id or (feats.get("spotify") if feats else None)
+        comments = nodata_comments(sid)
         if args.dry_run:
-            print(f"  ----    {label}  ->  '{grouping}'")
-        else:
-            try:
-                set_grouping(tr["dbid"], grouping)
-                print(f"  untag   {label}  ->  '{grouping}'")
-            except RuntimeError as e:
-                if _not_in_library(e):
-                    print(f"  NOLIB   {label}  (not in your Library — Add to Library, then re-run)")
-                    return "notinlib"
-                print(f"  FAIL    {label}  ({e})")
+            print(f"  ----    {label}  ->  '{grouping}'  [{comments}]")
+            return "untagged"
+        try:
+            set_grouping(tr["dbid"], grouping)
+            if not args.no_comments:
+                set_comments(tr["dbid"], comments)
+            print(f"  untag   {label}  ->  '{grouping}'  ({comments})")
+        except RuntimeError as e:
+            if _not_editable(e):
+                print(f"  NOLIB   {label}  (can't edit — cloud/streaming track or not in Library; Add to Library, then re-run)")
+                return "notinlib"
+            print(f"  FAIL    {label}  ({e})")
         return "untagged"
 
     energy = float(feats["energy"])
@@ -510,8 +592,8 @@ def classify_and_write(tr, feats, spotify_id, args):
         print(f"  tag     {label}\n            {grouping}   {nums}")
         return "tagged"
     except RuntimeError as e:
-        if _not_in_library(e):
-            print(f"  NOLIB   {label}  (not in your Library — Add to Library, then re-run)")
+        if _not_editable(e):
+            print(f"  NOLIB   {label}  (can't edit — cloud/streaming track or not in Library; Add to Library, then re-run)")
             return "notinlib"
         print(f"  FAIL    {label}  ({e})")
         return "untagged"
@@ -522,9 +604,16 @@ def classify_and_write(tr, feats, spotify_id, args):
 def main():
     p = argparse.ArgumentParser(description="Tag Apple Music tracks by language + mood, and fill BPM.")
     p.add_argument("--dry-run", action="store_true", help="Show results; write nothing")
-    p.add_argument("--force", action="store_true", help="Re-fetch + overwrite even if already tagged")
+    p.add_argument("--force", action="store_true",
+                   help="From scratch: re-search Spotify (ignore cached id) + re-fetch + "
+                        "overwrite, even if already tagged. Combine with --retry-nodata to "
+                        "re-validate only the no-data songs' ids.")
     p.add_argument("--retune", action="store_true",
                    help="Re-bucket from cached Comments data only — NO network, no rate limit")
+    p.add_argument("--retry-nodata", action="store_true",
+                   help="Re-attempt ONLY songs marked 'untagged no-data', reusing the cached "
+                        "Spotify id to skip the search (ReccoBeats adds tracks over time). "
+                        "Leaves already-tagged songs untouched.")
     p.add_argument("--batch", type=int, default=0, metavar="N",
                    help="Stop after N newly-fetched songs (rate-limit-safe chunking; 0 = no limit)")
     p.add_argument("--no-bpm", action="store_true", help="Tag mood only; don't write BPM")
@@ -542,7 +631,8 @@ def main():
     if not tracks:
         sys.exit("No tracks selected. Select songs in Music, then run again.")
 
-    mode = "RETUNE (offline)" if args.retune else "FETCH"
+    mode = ("RETUNE (offline)" if args.retune
+            else "RETRY-NODATA" if args.retry_nodata else "FETCH")
     print(f"Selected {len(tracks)} track(s).  Mode: {mode}\n")
     tagged = untagged = skipped = fetched = notinlib = 0
 
@@ -552,8 +642,8 @@ def main():
 
         # --- offline re-tune: re-bucket from the numbers already in Comments ---
         if args.retune:
-            if not cached:
-                print(f"  skip    {label}  (no cached data — fetch it once first)")
+            if "energy" not in cached:   # need real audio numbers to re-bucket
+                print(f"  skip    {label}  (no cached audio data — fetch it once first)")
                 skipped += 1
                 continue
             status = classify_and_write(tr, cached, None, args)
@@ -561,17 +651,35 @@ def main():
             notinlib += (status == "notinlib")
             continue
 
-        # --- network fetch ---
-        # "Done" = we already have cached numbers, OR we already tried and found
-        # none. Old-format tags (grouping set but Comments empty) are NOT done,
-        # so they get refreshed without needing --force.
-        already = bool(cached) or ("untagged no-data" in (tr["grouping"] or ""))
-        if already and not args.force:
-            print(f"  skip    {label}  (already done)")
+        # --- network fetch: decide whether to (re)fetch THIS song ---
+        # State of the song, from its cached Comments:
+        has_audio = "energy" in cached                          # already fully tagged
+        seen = (bool(cached)                                    # any cache marker, incl. no-data
+                or "untagged no-data" in (tr["grouping"] or ""))
+        # Scope is decided first — --retry-nodata pins it to the stuck songs even
+        # when combined with --force (which then only changes search freshness).
+        if args.retry_nodata:
+            do_fetch = seen and not has_audio                   # only the stuck no-data ones
+        elif args.force:
+            do_fetch = True                                     # redo everything selected
+        else:
+            do_fetch = not seen                                 # normal: only brand-new songs
+
+        if not do_fetch:
+            if args.retry_nodata and has_audio:
+                reason = "already tagged"
+            elif args.retry_nodata:
+                reason = "not processed yet — run a normal pass first"
+            else:
+                reason = "already done"
+            print(f"  skip    {label}  ({reason})")
             skipped += 1
             continue
 
-        spotify_id = cached.get("spotify")   # reuse cached id -> skip the search
+        # --force = "from scratch": drop any cached id and re-search Spotify (this
+        # re-validates a possibly-wrong id). Otherwise reuse the cached id and skip
+        # the rate-limited search.
+        spotify_id = None if args.force else cached.get("spotify")
         try:
             if not spotify_id:
                 spotify_id = spotify_find_track(tr["name"], tr["artist"], tr["dur_sec"])
@@ -599,9 +707,10 @@ def main():
         print("Untagged = no Spotify/ReccoBeats data (older or brand-new tracks).\n"
               "Grouped as '<lang> untagged no-data' — sort by Grouping to fix by hand.")
     if notinlib:
-        print(f"\n{notinlib} song(s) aren't in your Library so can't be edited. In Music,\n"
-              "select them and 'Add to Library' (and turn on Settings > General >\n"
-              "'Add Songs to Library'), then re-run to tag them.")
+        print(f"\n{notinlib} song(s) couldn't be edited — they're Apple Music cloud/streaming\n"
+              "tracks (or not in your Library), so their metadata is read-only. In Music,\n"
+              "select them and 'Add to Library' / download them (and turn on Settings >\n"
+              "General > 'Add Songs to Library' and Sync Library), then re-run to tag them.")
 
 
 if __name__ == "__main__":
