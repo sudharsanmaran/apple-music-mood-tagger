@@ -7,9 +7,11 @@ properties) and [TAGGING.md](TAGGING.md) is the *field reference*, this file is 
 **prescriptive layer**: build exactly these and stop — it's designed to avoid the
 usual mess of 50 overlapping lists.
 
-> Smart Playlist rules aren't scriptable, so these are built by hand in Music:
-> **File → New → Smart Playlist**. Sizes below are live counts at time of writing
-> and will drift as you add songs.
+> **Two ways to build these.** For *live, tunable* Smart Playlists, build by hand:
+> **File → New → Smart Playlist** (rules below). For an instant *static* version,
+> run **`python3 apple_music_playlists.py`** — it creates all of these as regular
+> playlists populated now (re-run to refresh; not live). Sizes below are live counts
+> at time of writing and will drift as you add songs.
 
 ## Design principles (how we avoid over-classification)
 

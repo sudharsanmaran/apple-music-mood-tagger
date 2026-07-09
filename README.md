@@ -80,6 +80,9 @@ Full reference: **[TAGGING.md](TAGGING.md)**.
 - **`apple_music_similar.py`** — "songs like this one." Select a seed, get a
   playlist of the closest matches by audio-feature distance. **100% offline** —
   uses the numbers already cached in Comments, so it works on your Tamil catalog.
+- **`apple_music_playlists.py`** — build the [PLAYLISTS.md](PLAYLISTS.md) set as
+  regular (static) playlists in one command. Snapshots, not live Smart Playlists
+  (Apple's AppleScript can't script smart rules) — re-run to refresh.
 - **`apple_music_bpm.py`** — a minimal, BPM-only alternative using
   [GetSongBPM](https://getsongbpm.com) (no Spotify needed, but weak coverage of
   regional music). Kept as a simpler option.

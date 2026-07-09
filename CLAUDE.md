@@ -68,6 +68,9 @@ is the load-bearing design idea:
   unless `--force`.
 - `apple_music_similar.py` reads the cached vectors and ranks by weighted Euclidean
   distance — fully offline, which is why it works on regional catalogs.
+- `apple_music_playlists.py` builds the `PLAYLISTS.md` set as **static** playlists
+  (AppleScript can't create live Smart Playlists or nest playlists into folders), so
+  they're name-prefixed snapshots refreshed by re-running.
 
 **Match confidence:** `spotify_find_track` scores by artist overlap, title-word
 overlap, and duration, and returns `None` below `MATCH_MIN_SCORE` rather than banking
