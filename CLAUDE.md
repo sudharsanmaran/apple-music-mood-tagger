@@ -23,8 +23,8 @@ python3 apple_music_mood.py --dry-run     # preview, writes nothing
 python3 apple_music_mood.py               # fetch + tag NEW songs only
 python3 apple_music_mood.py --retune      # OFFLINE re-bucket from cached data
 python3 apple_music_mood.py --force       # from scratch: re-search Spotify + overwrite
-python3 apple_music_mood.py --retry-nodata        # retry only stuck no-data songs, reuse cached id
-python3 apple_music_mood.py --retry-nodata --force # same, but re-search Spotify (re-validate ids)
+python3 apple_music_mood.py --retry-nodata        # retry stuck no-data songs: lookup, then clip-analysis fallback
+python3 apple_music_mood.py --retry-nodata --force # also revisit 'extract-failed' + re-search from scratch
 python3 apple_music_mood.py --batch 100   # stop after 100 newly-fetched songs
 
 python3 apple_music_similar.py            # playlist of songs like the selection (offline)
@@ -52,9 +52,17 @@ is the load-bearing design idea:
   thresholds instantly across the library.
 - `--force` = **from scratch**: re-search Spotify (ignore cached id) + refetch +
   overwrite everything selected. Use it to re-validate a possibly-wrong id.
-- `--retry-nodata` re-attempts **only** the stuck `no-data` songs, **reusing** the
-  cached id to skip the rate-limited search (ReccoBeats' catalog grows over time).
-  Add `--force` to re-search those from scratch instead.
+- `--retry-nodata` re-attempts **only** the stuck `no-data` songs: first the
+  ReccoBeats **lookup** (reusing the cached id), then a **clip-analysis fallback** —
+  fetch a free 30s **Deezer** MP3 preview and POST it to ReccoBeats'
+  `/v1/analysis/audio-features` (`extract_features` → `reccobeats_extract`). Preview
+  matching is exact-first: **Tier 1** by ISRC (Spotify id → `/tracks` → ISRC → Deezer
+  `/track/isrc:`), **Tier 2** a duration-gated fuzzy Deezer search that refuses
+  rather than guess. Extracted features are **approximate** — tagged `approx` in
+  Grouping + `src=analysis` in Comments. If both lookup and extraction fail, the
+  song is marked `extract-failed` and skipped on later `--retry-nodata` runs;
+  `--force` revisits it. This is the fix for regional catalogs ReccoBeats' lookup
+  doesn't cover.
 - The **Spotify search is the expensive, rate-limited step; ReccoBeats is cheap** —
   so a found id is always banked (even on no-data) and reused, never re-searched
   unless `--force`.

@@ -48,11 +48,12 @@ HOW TO RUN
          python3 apple_music_mood.py --retune    # OFFLINE: re-bucket from cached
                                                  #   Comments data, no network at all
          python3 apple_music_mood.py --retry-nodata  # re-attempt ONLY the stuck
-                                                 #   'untagged no-data' songs, REUSING
-                                                 #   the cached Spotify id (ReccoBeats
-                                                 #   keeps adding tracks over time)
-         python3 apple_music_mood.py --retry-nodata --force  # same, but re-search
-                                                 #   Spotify from scratch (re-validate ids)
+                                                 #   'untagged no-data' songs: ReccoBeats
+                                                 #   lookup first, then FALL BACK to
+                                                 #   analysing a Deezer preview clip
+                                                 #   (features marked 'approx')
+         python3 apple_music_mood.py --retry-nodata --force  # also revisit prior
+                                                 #   'extract-failed' + re-search from scratch
          python3 apple_music_mood.py --no-bpm    # tag mood only, skip BPM
 
 Workflow: fetch each song once (the only rate-limited step); the raw numbers +
@@ -99,9 +100,16 @@ SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API = "https://api.spotify.com/v1"
 RECCOBEATS_API = "https://api.reccobeats.com/v1"
+RECCOBEATS_EXTRACT = "https://api.reccobeats.com/v1/analysis/audio-features"
+DEEZER_API = "https://api.deezer.com"
 
 REQUEST_PAUSE = 0.5      # seconds between lookups — spreads calls out to stay
                          # under Spotify's rolling ~30s rate-limit window
+DEEZER_PAUSE = 0.2       # Deezer allows 50 req / 5s; 0.2s keeps us well under
+EXTRACT_PAUSE = 1.0      # the ReccoBeats extraction endpoint does heavier work
+                         # (audio analysis) and its limit is undisclosed — pace it
+DUR_MATCH_TOL = 3        # Tier-2 fuzzy: accept a Deezer hit only within this many
+                         # seconds of the Music track's duration (else refuse)
 
 # Minimum match score before we trust (and bank) a Spotify id. A real match
 # clears this via artist overlap (+3), a strong title match (+2), or a tight
@@ -332,6 +340,125 @@ def reccobeats_features(spotify_id):
     return content[0] if content else None
 
 
+# --- Clip analysis fallback (Deezer preview -> ReccoBeats extraction) --------
+# When ReccoBeats' Spotify-mirror LOOKUP has no data for a track (common for
+# regional catalogs), we fetch a free 30s preview clip and have ReccoBeats
+# ANALYZE the audio directly — same feature schema, so the classifier is
+# unchanged. The clip source is Deezer (its previews are MP3, which the
+# extraction endpoint accepts). Correctness first: Tier 1 matches by ISRC (a
+# globally-unique recording id, so no mismatch), Tier 2 falls back to a
+# duration-gated fuzzy search and refuses rather than guess.
+
+def spotify_isrc(spotify_id):
+    """ISRC for a Spotify track id (via /tracks). None on failure."""
+    if not spotify_id:
+        return None
+    try:
+        d = _fetch_json(f"{SPOTIFY_API}/tracks/{spotify_id}",
+                        headers={"Authorization": "Bearer " + spotify_token()})
+    except RateLimited:
+        raise
+    except Exception:
+        return None
+    return (d.get("external_ids") or {}).get("isrc")
+
+
+def _deezer_get(path):
+    """GET a Deezer public endpoint. Deezer signals errors in the JSON body
+    (200 + {'error': ...}), so treat those as a miss. None on any failure."""
+    try:
+        d = _fetch_json(f"{DEEZER_API}{path}")
+    except RateLimited:
+        raise
+    except Exception:
+        return None
+    return None if (not isinstance(d, dict) or d.get("error")) else d
+
+
+def deezer_preview_by_isrc(isrc):
+    """Tier 1 — exact Deezer track by ISRC. Returns (preview_url, duration_sec)."""
+    if not isrc:
+        return None, 0
+    d = _deezer_get(f"/track/isrc:{urllib.parse.quote(isrc)}")
+    if not d or not d.get("preview"):
+        return None, 0
+    return d["preview"], d.get("duration", 0)
+
+
+def deezer_preview_search(name, artist, dur_sec):
+    """Tier 2 — fuzzy Deezer search. Accept a hit ONLY if its duration is within
+    DUR_MATCH_TOL of the Music track's; else refuse (return None) rather than risk
+    analysing the wrong song."""
+    if not dur_sec:
+        return None, 0          # no duration to gate on -> don't guess
+    q = urllib.parse.urlencode({"q": f"{_clean(name)} {_clean(artist)}"})
+    d = _deezer_get(f"/search?{q}")
+    if not d:
+        return None, 0
+    for it in d.get("data", []):
+        if it.get("preview") and abs(it.get("duration", 0) - dur_sec) <= DUR_MATCH_TOL:
+            return it["preview"], it.get("duration", 0)
+    return None, 0
+
+
+def _download_bytes(url, limit=6_000_000):
+    """Download up to `limit` bytes (ReccoBeats caps uploads at 5MB; previews are
+    ~0.5MB). None on failure."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read(limit)
+    except Exception:
+        return None
+
+
+def reccobeats_extract(mp3_bytes):
+    """POST an audio clip to the ReccoBeats extraction endpoint and return its
+    feature dict (same schema as the lookup), or None. Raises RateLimited on 429."""
+    if not mp3_bytes:
+        return None
+    boundary = "----reccobeatsboundary7c1f9a"
+    body = b"".join([
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="audioFile"; filename="clip.mp3"\r\n',
+        b"Content-Type: audio/mpeg\r\n\r\n", mp3_bytes, b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ])
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
+               "User-Agent": USER_AGENT, "Accept": "application/json"}
+    req = urllib.request.Request(RECCOBEATS_EXTRACT, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise RateLimited(e.headers.get("Retry-After", "?"))
+        return None
+    except Exception:
+        return None
+    if isinstance(data, dict) and "content" in data:      # unwrap if wrapped
+        c = data.get("content") or []
+        data = c[0] if c else None
+    return data if (data and data.get("energy") is not None) else None
+
+
+def extract_features(tr, spotify_id):
+    """Recover features for one no-data track by analysing a preview clip.
+    Returns (features_dict_or_None, isrc). Tier 1 (ISRC) then Tier 2 (fuzzy)."""
+    isrc = spotify_isrc(spotify_id) if spotify_id else None
+    prev, ddur = deezer_preview_by_isrc(isrc)
+    if prev and ddur and tr.get("dur_sec") and abs(ddur - tr["dur_sec"]) > DUR_MATCH_TOL:
+        print(f"            note: Deezer edit differs ({tr['dur_sec']:.0f}s vs {ddur}s) "
+              f"— same ISRC, analysing anyway")
+    if not prev:
+        prev, ddur = deezer_preview_search(tr["name"], tr["artist"], tr.get("dur_sec", 0))
+    if not prev:
+        return None, isrc
+    time.sleep(DEEZER_PAUSE)
+    feats = reccobeats_extract(_download_bytes(prev))
+    return feats, isrc
+
+
 # --- Classification ----------------------------------------------------------
 
 def category_label(energy, valence, danceability):
@@ -431,11 +558,13 @@ def _band(value, low_edge, high_edge, low, mid, high):
     return high
 
 
-def build_tags(lang, feats, energy, valence, dance, bpm, cat_label):
+def build_tags(lang, feats, energy, valence, dance, bpm, cat_label, approx=False):
     """Independent trait tags for the Grouping field. A song carries EVERY tag
     it qualifies for, so Smart Playlists ('Grouping contains groovy') can put
     one song in many lists — no single-category priority needed. The suggested
     category word (Groove/Warm/...) is appended so one-rule playlists also work.
+    `approx=True` (features from clip analysis, not Spotify) adds an 'approx' tag
+    so you can see/filter these in Music.
     """
     tags = [lang.lower()]
     tags.append(_band(energy, ENERGY_LOW_MAX, ENERGY_HIGH,
@@ -457,13 +586,16 @@ def build_tags(lang, feats, energy, valence, dance, bpm, cat_label):
         tags.append(_band(bpm, TEMPO_SLOW_MAX, TEMPO_FAST_MIN, "slow", "mid-tempo", "fast"))
 
     tags.append(cat_label.split(" (")[0])   # the suggested category word
+    if approx:
+        tags.append("approx")               # features from clip analysis, not Spotify
     return " ".join(tags)
 
 
-def full_comments(feats, bpm, spotify_id=None):
+def full_comments(feats, bpm, spotify_id=None, src=None):
     """Every raw audio number we have, stored in Comments. Doubles as a cache:
     the numbers let us re-bucket offline (--retune), and spotify=<id> lets a
-    re-fetch skip the (rate-limited) Spotify search."""
+    re-fetch skip the (rate-limited) Spotify search. `src=analysis` marks features
+    that came from clip analysis rather than Spotify's model."""
     parts = []
     for k in ("energy", "valence", "danceability", "acousticness",
               "instrumentalness", "speechiness", "liveness", "loudness"):
@@ -477,20 +609,23 @@ def full_comments(feats, bpm, spotify_id=None):
             parts.append(f"{k}={feats[k]}")
     if spotify_id:
         parts.append(f"spotify={spotify_id}")
+    if src:
+        parts.append(f"src={src}")
     return " ".join(parts)
 
 
-def nodata_comments(spotify_id):
+def nodata_comments(spotify_id, extract_failed=False):
     """Comments for a song we processed but couldn't get audio features for.
     Records a CLEAR reason and — crucially — keeps the Spotify id when we have
     one, so a later `--retry-nodata` can skip the rate-limited search and just
     re-hit ReccoBeats (whose catalog keeps growing):
         'no-audio-data spotify=<id>'  -> found on Spotify, but ReccoBeats empty
         'no-spotify-match'            -> never matched on Spotify (no id to keep)
+    `extract_failed=True` appends 'extract-failed' so --retry-nodata skips it on
+    later runs (no Deezer preview / analysis failed); --force revisits it.
     """
-    if spotify_id:
-        return f"no-audio-data spotify={spotify_id}"
-    return "no-spotify-match"
+    base = f"no-audio-data spotify={spotify_id}" if spotify_id else "no-spotify-match"
+    return base + " extract-failed" if extract_failed else base
 
 
 def parse_comments(text):
@@ -499,7 +634,8 @@ def parse_comments(text):
       - full cache  -> feature numbers (energy=…) + spotify id
       - no-audio    -> {'no_audio': True, 'spotify': <id>}  (retry can reuse id)
       - no-spotify  -> {'no_spotify': True}
-    Use `'energy' in result` to tell "has real audio data" from a no-data marker."""
+    Also flags 'extract-failed' and 'src=analysis'. Use `'energy' in result` to
+    tell "has real audio data" from a no-data marker."""
     if not text:
         return {}
     out = {}
@@ -509,6 +645,9 @@ def parse_comments(text):
             continue
         if tok == "no-spotify-match":
             out["no_spotify"] = True
+            continue
+        if tok == "extract-failed":
+            out["extract_failed"] = True
             continue
         if "=" not in tok:
             continue
@@ -524,14 +663,17 @@ def parse_comments(text):
                 out["tempo"] = int(float(v))
             except ValueError:
                 pass
-        elif k in ("key", "mode", "isrc", "spotify"):
+        elif k in ("key", "mode", "isrc", "spotify", "src"):
             out[k] = v
     return out
 
 
-def classify_and_write(tr, feats, spotify_id, args):
+def classify_and_write(tr, feats, spotify_id, args, analyzed=False, extract_failed=False):
     """Classify a feature dict and write all fields. Used by both the network
-    fetch path and the offline --retune path. Returns 'tagged' or 'untagged'."""
+    fetch path and the offline --retune path. Returns 'tagged' or 'untagged'.
+    `analyzed=True` marks features that came from clip analysis (adds 'approx' to
+    Grouping + 'src=analysis' to Comments). `extract_failed=True` records that the
+    extraction fallback was tried and failed, so --retry-nodata skips it later."""
     label = f'{tr["name"]} — {tr["artist"]}'
 
     if not feats or feats.get("energy") is None:
@@ -541,7 +683,7 @@ def classify_and_write(tr, feats, spotify_id, args):
         # rate-limited search result just because ReccoBeats had nothing yet. This
         # is what lets --retry-nodata re-poll ReccoBeats cheaply later.
         sid = spotify_id or (feats.get("spotify") if feats else None)
-        comments = nodata_comments(sid)
+        comments = nodata_comments(sid, extract_failed=extract_failed)
         if args.dry_run:
             print(f"  ----    {label}  ->  '{grouping}'  [{comments}]")
             return "untagged"
@@ -570,8 +712,9 @@ def classify_and_write(tr, feats, spotify_id, args):
         except (ValueError, TypeError):
             bpm = None
 
-    grouping = build_tags(lang, feats, energy, valence, dance, bpm, cat)
-    comments = full_comments(feats, bpm, spotify_id or feats.get("spotify"))
+    grouping = build_tags(lang, feats, energy, valence, dance, bpm, cat, approx=analyzed)
+    comments = full_comments(feats, bpm, spotify_id or feats.get("spotify"),
+                             src="analysis" if analyzed else None)
     rating = round(energy * 100)
     movement = round(dance * 100)
     nums = f"[rating={rating} mvt={movement}" + (f" bpm={bpm}]" if bpm else "]")
@@ -611,9 +754,10 @@ def main():
     p.add_argument("--retune", action="store_true",
                    help="Re-bucket from cached Comments data only — NO network, no rate limit")
     p.add_argument("--retry-nodata", action="store_true",
-                   help="Re-attempt ONLY songs marked 'untagged no-data', reusing the cached "
-                        "Spotify id to skip the search (ReccoBeats adds tracks over time). "
-                        "Leaves already-tagged songs untouched.")
+                   help="Re-attempt ONLY the stuck 'untagged no-data' songs. Tries the "
+                        "ReccoBeats lookup first (reusing the cached id), then FALLS BACK to "
+                        "analysing a Deezer preview clip (features marked 'approx'). Leaves "
+                        "tagged songs untouched; skips prior 'extract-failed' unless --force.")
     p.add_argument("--batch", type=int, default=0, metavar="N",
                    help="Stop after N newly-fetched songs (rate-limit-safe chunking; 0 = no limit)")
     p.add_argument("--no-bpm", action="store_true", help="Tag mood only; don't write BPM")
@@ -634,7 +778,7 @@ def main():
     mode = ("RETUNE (offline)" if args.retune
             else "RETRY-NODATA" if args.retry_nodata else "FETCH")
     print(f"Selected {len(tracks)} track(s).  Mode: {mode}\n")
-    tagged = untagged = skipped = fetched = notinlib = 0
+    tagged = untagged = skipped = fetched = notinlib = analyzed = 0
 
     for tr in tracks:
         label = f'{tr["name"]} — {tr["artist"]}'
@@ -646,7 +790,8 @@ def main():
                 print(f"  skip    {label}  (no cached audio data — fetch it once first)")
                 skipped += 1
                 continue
-            status = classify_and_write(tr, cached, None, args)
+            status = classify_and_write(tr, cached, None, args,
+                                        analyzed=(cached.get("src") == "analysis"))
             tagged += (status == "tagged"); untagged += (status == "untagged")
             notinlib += (status == "notinlib")
             continue
@@ -656,10 +801,12 @@ def main():
         has_audio = "energy" in cached                          # already fully tagged
         seen = (bool(cached)                                    # any cache marker, incl. no-data
                 or "untagged no-data" in (tr["grouping"] or ""))
+        prior_fail = cached.get("extract_failed")               # extraction tried before, failed
         # Scope is decided first — --retry-nodata pins it to the stuck songs even
         # when combined with --force (which then only changes search freshness).
         if args.retry_nodata:
-            do_fetch = seen and not has_audio                   # only the stuck no-data ones
+            # only the stuck no-data ones; skip prior extract-failed unless --force
+            do_fetch = seen and not has_audio and (args.force or not prior_fail)
         elif args.force:
             do_fetch = True                                     # redo everything selected
         else:
@@ -668,7 +815,9 @@ def main():
         if not do_fetch:
             if args.retry_nodata and has_audio:
                 reason = "already tagged"
-            elif args.retry_nodata:
+            elif args.retry_nodata and prior_fail:
+                reason = "extraction failed before (use --force to retry)"
+            elif args.retry_nodata and not seen:
                 reason = "not processed yet — run a normal pass first"
             else:
                 reason = "already done"
@@ -680,32 +829,53 @@ def main():
         # re-validates a possibly-wrong id). Otherwise reuse the cached id and skip
         # the rate-limited search.
         spotify_id = None if args.force else cached.get("spotify")
+        is_analyzed = False
         try:
             if not spotify_id:
                 spotify_id = spotify_find_track(tr["name"], tr["artist"], tr["dur_sec"])
             feats = reccobeats_features(spotify_id) if spotify_id else None
+            time.sleep(REQUEST_PAUSE)
+            # --- extraction fallback (--retry-nodata only): lookup had nothing, so
+            # analyse a Deezer preview clip directly. Features are approximate. ---
+            if args.retry_nodata and (not feats or feats.get("energy") is None):
+                efeats, isrc = extract_features(tr, spotify_id)
+                time.sleep(EXTRACT_PAUSE)
+                if efeats and efeats.get("energy") is not None:
+                    if spotify_id:
+                        efeats["spotify"] = spotify_id
+                    if isrc:
+                        efeats["isrc"] = isrc
+                    feats, is_analyzed = efeats, True
         except RateLimited as e:
             print(f"\n⚠  Rate limited by the API (Retry-After: {e.retry_after}s).")
             print(f"   Tagged {tagged} song(s) before the limit. Wait, then re-run —")
-            print(f"   already-tagged songs are skipped automatically (no --force needed).")
+            print(f"   already-done songs are skipped automatically (no --force needed).")
             break
-        time.sleep(REQUEST_PAUSE)
 
-        status = classify_and_write(tr, feats, spotify_id, args)
+        if is_analyzed:
+            status = classify_and_write(tr, feats, spotify_id, args, analyzed=True)
+        elif args.retry_nodata and (not feats or feats.get("energy") is None):
+            # lookup AND extraction both failed -> record it so we don't retry forever
+            status = classify_and_write(tr, None, spotify_id, args, extract_failed=True)
+        else:
+            status = classify_and_write(tr, feats, spotify_id, args)
         tagged += (status == "tagged"); untagged += (status == "untagged")
-        notinlib += (status == "notinlib")
+        notinlib += (status == "notinlib"); analyzed += (is_analyzed and status == "tagged")
 
         fetched += 1
         if args.batch and fetched >= args.batch:
             print(f"\n— Batch limit ({args.batch}) reached. Re-run to continue; "
-                  f"already-tagged songs are skipped automatically.")
+                  f"already-done songs are skipped automatically.")
             break
 
     print(f"\nDone. Tagged: {tagged}   Untagged (no data): {untagged}   "
           f"Skipped: {skipped}   Not in Library: {notinlib}")
+    if analyzed:
+        print(f"Of those tagged, {analyzed} were recovered by clip analysis "
+              f"(marked 'approx' + 'src=analysis') — features are approximate.")
     if untagged:
-        print("Untagged = no Spotify/ReccoBeats data (older or brand-new tracks).\n"
-              "Grouped as '<lang> untagged no-data' — sort by Grouping to fix by hand.")
+        print("Untagged = no features from lookup OR clip analysis. Grouped as\n"
+              "'<lang> untagged no-data' — sort by Grouping to fix by hand.")
     if notinlib:
         print(f"\n{notinlib} song(s) couldn't be edited — they're Apple Music cloud/streaming\n"
               "tracks (or not in your Library), so their metadata is read-only. In Music,\n"
