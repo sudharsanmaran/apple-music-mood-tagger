@@ -23,6 +23,11 @@ For every selected song it:
 4. writes everything back into the song's metadata so you can build
    **Smart Playlists** that group similar songs and stay up to date.
 
+When ReccoBeats has no data for a track (common for older/regional songs),
+`--retry-nodata` recovers it by analyzing a 30-second **[Deezer](https://www.deezer.com)**
+preview clip through ReccoBeats' audio-analysis endpoint — so even songs no
+database covers still get tagged (marked `approx`, since a preview is less exact).
+
 Because the data lives on each song (and syncs across your devices via iCloud
 Music Library), you tag once and re-tune offline forever.
 
@@ -34,15 +39,17 @@ no `pip install`), and a free Spotify Developer app.
 ```sh
 # 1. Create a free app at https://developer.spotify.com/dashboard (Web API).
 #    Redirect URI can be http://127.0.0.1:8888 . Copy the Client ID + Secret.
+#    Either export them, or put them in a .env file next to the script (gitignored).
 export SPOTIFY_CLIENT_ID="your-client-id"
 export SPOTIFY_CLIENT_SECRET="your-client-secret"
 
 # 2. In the Music app, select the tracks you want to tag.
 
 # 3. Preview, then run:
-python3 apple_music_mood.py --dry-run    # shows what it would do, writes nothing
-python3 apple_music_mood.py              # tag new songs
-python3 apple_music_mood.py --retune     # re-bucket offline from cached data (no network)
+python3 apple_music_mood.py --dry-run       # shows what it would do, writes nothing
+python3 apple_music_mood.py                 # tag new songs
+python3 apple_music_mood.py --retry-nodata  # recover songs ReccoBeats' lookup misses (analyzes a Deezer preview)
+python3 apple_music_mood.py --retune        # re-bucket offline from cached data (no network)
 ```
 
 The first time, macOS asks to let Terminal control Music — click **OK**.
@@ -57,8 +64,9 @@ for the field/tag reference.
 
 ```
 Apple Music song (name + artist)
-   → Spotify search        → track ID         [needs a free Spotify app; cached after first run]
-   → ReccoBeats            → audio features    [free, no key]
+   → Spotify search        → track ID          [needs a free Spotify app; cached after first run]
+   → ReccoBeats lookup     → audio features     [free, no key]
+       ↳ no data? analyze a Deezer preview clip → ReccoBeats extraction   [recovers regional tracks; tagged 'approx']
    → classify + tag        → write to Music metadata
 ```
 
@@ -100,8 +108,9 @@ drop the Spotify dependency, and the "find similar songs" feature.
 
 ## Credits
 
-- Audio features by **[ReccoBeats](https://reccobeats.com)**.
+- Audio features + clip analysis by **[ReccoBeats](https://reccobeats.com)**.
 - Track lookup via the **Spotify Web API**.
+- Preview clips for analysis by **[Deezer](https://www.deezer.com)**.
 - BPM (legacy script) by **[GetSongBPM](https://getsongbpm.com)**.
 
 ## License
