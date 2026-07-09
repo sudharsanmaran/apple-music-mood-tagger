@@ -15,8 +15,13 @@ Group the library by how songs *feel*.
 - [x] Cache everything on the song so re-tuning is offline + instant (`--retune`)
 - [x] Incremental by design — already-tagged songs are skipped before any API call
 - [x] `--batch N` for rate-limit-safe first passes
+- [x] Recover songs ReccoBeats' lookup misses via clip analysis — a Deezer
+      preview → ReccoBeats extraction, tagged `approx` (`--retry-nodata`)
+- [x] Curated Smart Playlist system + one-command static builder
+      (`PLAYLISTS.md`, `apple_music_playlists.py`)
 - [ ] Improve language detection (foreign-label Tamil songs misread as English)
-- [ ] Optional Deezer bridge to drop the Spotify dependency
+- [ ] Optional Deezer bridge to drop the Spotify dependency entirely (we already
+      use Deezer for preview clips; still need Spotify for the id → ISRC step)
 
 ## 🚧 Stage 2 — Find similar songs (started)
 
