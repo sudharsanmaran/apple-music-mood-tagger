@@ -874,8 +874,13 @@ def main():
         print(f"Of those tagged, {analyzed} were recovered by clip analysis "
               f"(marked 'approx' + 'src=analysis') — features are approximate.")
     if untagged:
-        print("Untagged = no features from lookup OR clip analysis. Grouped as\n"
-              "'<lang> untagged no-data' — sort by Grouping to fix by hand.")
+        if args.retry_nodata:
+            print("Untagged = no features from lookup OR clip analysis. Grouped as\n"
+                  "'<lang> untagged no-data' — sort by Grouping to fix by hand.")
+        else:
+            print("Untagged = no ReccoBeats lookup data (clip analysis NOT tried in this\n"
+                  "mode). Run --retry-nodata to recover them via a preview clip, or\n"
+                  "fix by hand (Grouping contains 'untagged').")
     if notinlib:
         print(f"\n{notinlib} song(s) couldn't be edited — they're Apple Music cloud/streaming\n"
               "tracks (or not in your Library), so their metadata is read-only. In Music,\n"
